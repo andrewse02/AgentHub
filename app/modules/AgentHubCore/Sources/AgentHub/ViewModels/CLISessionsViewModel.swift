@@ -102,6 +102,12 @@ public final class CLISessionsViewModel {
   private var existingSessionIdsBeforeTerminal: Set<String> = []
   /// Whether the next auto-observed session should show terminal view (from "Start in Hub")
   public var pendingHubSessionWithTerminal: Bool = false
+
+  /// Session IDs awaiting progressive restoration on app launch
+  private var pendingRestorationSessionIds: Set<String> = []
+
+  /// Terminal view IDs loaded from persistence, used during progressive restoration
+  private var restoringTerminalViewIds: Set<String> = []
   /// Session IDs that should show terminal view (tracks current state for each row)
   public var sessionsWithTerminalView: Set<String> = []
 
@@ -305,6 +311,14 @@ public final class CLISessionsViewModel {
   /// Sessions being started in Hub's embedded terminal (no session ID yet)
   public var pendingHubSessions: [PendingHubSession] = []
 
+  /// Maps pending session UUIDs to their resolved real session IDs.
+  /// Used by the sidebar to update `primarySessionId` when a pending session becomes real.
+  public var resolvedPendingSessions: [UUID: String] = [:]
+
+  /// Set when a new pending session is created; observed by the sidebar to auto-select it.
+  /// The sidebar nils this out after reading it.
+  public var lastCreatedPendingId: UUID?
+
   /// Active terminal views keyed by worktree path
   /// Preserves terminal PTY across pending → real session transition
   public var activeTerminals: [String: TerminalContainerView] = [:]
@@ -483,6 +497,9 @@ public final class CLISessionsViewModel {
 
           // Check for pending auto-observe
           self.processPendingAutoObserve()
+
+          // Progressively restore sessions from persistence as they become available
+          self.processPendingSessionRestorations()
         }
       }
     }
@@ -531,35 +548,27 @@ public final class CLISessionsViewModel {
         return
       }
 
-      // Load persisted monitored session IDs
+      // Store persisted session IDs for progressive restoration
       let persistedSessionIds = loadPersistedSessionIds()
+      if !persistedSessionIds.isEmpty {
+        pendingRestorationSessionIds = persistedSessionIds
+        // Load terminal view state for restoration decisions
+        if let tvData = UserDefaults.standard.data(forKey: terminalViewKey),
+           let tvIds = try? JSONDecoder().decode([String].self, from: tvData) {
+          restoringTerminalViewIds = Set(tvIds)
+        }
+      }
 
-      // Phase 1: Add repositories
+      // Add repositories (triggers refreshSessions → setupSubscriptions)
       loadingState = .restoringRepositories
-      for path in paths {
-        await monitorService.addRepository(path)
-      }
+      await monitorService.addRepositories(paths)
       restoreExpansionState()
-
-      // If no sessions to restore, we're done
-      guard !persistedSessionIds.isEmpty else {
-        loadingState = .idle
-        return
-      }
-
-      // Phase 2: Wait for sessions to appear in selectedRepositories
-      loadingState = .restoringMonitoredSessions
-      let foundSessions = await waitForSessions(
-        sessionIds: persistedSessionIds,
-        timeout: .seconds(3)
-      )
-
-      // Phase 3: Restore monitoring for found sessions
-      if !foundSessions.isEmpty {
-        restoreMonitoredSessions(sessionIdsToRestore: Set(foundSessions.map { $0.id }))
-      }
-
       loadingState = .idle
+
+      // Safety timeout: stop trying to restore after 10 seconds
+      try? await Task.sleep(for: .seconds(10))
+      pendingRestorationSessionIds.removeAll()
+      restoringTerminalViewIds.removeAll()
     }
   }
 
@@ -572,23 +581,39 @@ public final class CLISessionsViewModel {
     return Set(sessionIds)
   }
 
-  /// Waits for sessions to appear in selectedRepositories
-  private func waitForSessions(
-    sessionIds: Set<String>,
-    timeout: Duration
-  ) async -> [CLISession] {
-    let deadline = ContinuousClock.now + timeout
 
-    while ContinuousClock.now < deadline {
-      let foundSessions = allSessions.filter { sessionIds.contains($0.id) }
-      if !foundSessions.isEmpty {
-        return foundSessions
+  /// Progressively restores sessions as they become available via setupSubscriptions.
+  /// Called each time selectedRepositories is updated. Populates monitoring state directly
+  /// (skips persistMonitoredSessions to avoid overwriting the complete persisted state).
+  private func processPendingSessionRestorations() {
+    guard !pendingRestorationSessionIds.isEmpty else { return }
+
+    var restoredIds: Set<String> = []
+
+    for sessionId in pendingRestorationSessionIds {
+      if let session = findSession(byId: sessionId),
+         sessionFileExists(session: session) {
+        // Populate monitoring state directly (skip persistence — persisted state is already correct)
+        monitoredSessionIds.insert(session.id)
+        monitoredSessionBackup[session.id] = session
+
+        // Restore terminal view mode from persisted state
+        if restoringTerminalViewIds.contains(session.id) {
+          sessionsWithTerminalView.insert(session.id)
+        }
+
+        // Start polling for file changes
+        startPolling(session: session)
+
+        restoredIds.insert(sessionId)
       }
-      try? await Task.sleep(for: .milliseconds(100))
     }
 
-    // Timeout - return whatever we have
-    return allSessions.filter { sessionIds.contains($0.id) }
+    if !restoredIds.isEmpty {
+      pendingRestorationSessionIds.subtract(restoredIds)
+      expandItemsContainingMonitoredSessions()
+      loadCustomNames()
+    }
   }
 
   private func restoreExpansionState() {
@@ -663,45 +688,16 @@ public final class CLISessionsViewModel {
     }
   }
 
-  /// Restores monitored sessions from UserDefaults or provided set
-  private func restoreMonitoredSessions(sessionIdsToRestore: Set<String>? = nil) {
-    let sessionIds: [String]
+  /// Restores monitored sessions from a provided set of session IDs.
+  /// Used for non-launch restoration scenarios (e.g., explicit user actions).
+  /// Launch-time restoration is handled progressively via processPendingSessionRestorations().
+  private func restoreMonitoredSessions(sessionIdsToRestore: Set<String>) {
+    guard !sessionIdsToRestore.isEmpty else { return }
 
-    if let provided = sessionIdsToRestore {
-      sessionIds = Array(provided)
-    } else if let data = UserDefaults.standard.data(forKey: monitoredSessionsKey),
-              let decoded = try? JSONDecoder().decode([String].self, from: data) {
-      sessionIds = decoded
-    } else {
-      return
-    }
-
-    guard !sessionIds.isEmpty else { return }
-
-    for sessionId in sessionIds {
-      if let session = findSession(byId: sessionId) {
-        if sessionFileExists(session: session) {
-          startMonitoring(session: session)
-        }
-      }
-    }
-
-    // Restore terminal view state and start polling for sessions in monitor/list mode.
-    // After startMonitoring, all sessions default to terminal view (no polling).
-    // We need to switch sessions that were in monitor/list mode back to that mode with polling.
-    if let data = UserDefaults.standard.data(forKey: terminalViewKey),
-       let persistedTerminalSessionIds = try? JSONDecoder().decode([String].self, from: data) {
-      let persistedSet = Set(persistedTerminalSessionIds)
-
-      // Find sessions that are monitored but were NOT in terminal view (were in monitor/list mode)
-      for sessionId in monitoredSessionIds {
-        if !persistedSet.contains(sessionId) {
-          // This session was in monitor/list mode - switch it back and start polling
-          sessionsWithTerminalView.remove(sessionId)
-          if let session = monitoredSessionBackup[sessionId] {
-            startPolling(session: session)
-          }
-        }
+    for sessionId in sessionIdsToRestore {
+      if let session = findSession(byId: sessionId),
+         sessionFileExists(session: session) {
+        startMonitoring(session: session)
       }
     }
 
@@ -772,23 +768,25 @@ public final class CLISessionsViewModel {
 
   // MARK: - Repository Management
 
-  /// Opens a directory picker and adds the selected repository
+  /// Opens a directory picker and adds the selected repository.
+  /// Uses asyncAfter to schedule NSOpenPanel creation on a future run loop iteration,
+  /// avoiding HIRunLoopSemaphore deadlock that occurs during GCD dispatch queue drain.
   public func showAddRepositoryPicker() {
-    // [CLISessionsVM] showAddRepositoryPicker called")
     #if canImport(AppKit)
-    let panel = NSOpenPanel()
-    panel.title = "Select Repository"
-    panel.message = "Choose a git repository to monitor CLI sessions"
-    panel.canChooseFiles = false
-    panel.canChooseDirectories = true
-    panel.allowsMultipleSelection = false
-    panel.canCreateDirectories = false
+    DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+      MainActor.assumeIsolated {
+        let panel = NSOpenPanel()
+        panel.title = "Select Repository"
+        panel.message = "Choose a git repository to monitor CLI sessions"
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.canCreateDirectories = false
 
-    if panel.runModal() == .OK, let url = panel.url {
-      // [CLISessionsVM] User selected path: \(url.path)")
-      addRepository(at: url.path)
-    } else {
-      // [CLISessionsVM] User cancelled picker")
+        if panel.runModal() == .OK, let url = panel.url {
+          self.addRepository(at: url.path)
+        }
+      }
     }
     #endif
   }
@@ -828,32 +826,6 @@ public final class CLISessionsViewModel {
     Task {
       await monitorService.removeRepository(repository.path)
     }
-  }
-
-  /// Creates a new worktree for the given repository with progress reporting
-  /// - Parameters:
-  ///   - repository: The repository to create the worktree in
-  ///   - branchName: The name for the new branch
-  ///   - directoryName: The directory name for the worktree
-  ///   - baseBranch: The branch to base the new branch on (nil = HEAD)
-  ///   - onProgress: Callback for progress updates
-  public func createWorktree(
-    for repository: SelectedRepository,
-    branchName: String,
-    directoryName: String,
-    baseBranch: String?,
-    onProgress: @escaping @Sendable (WorktreeCreationProgress) async -> Void
-  ) async throws {
-    _ = try await worktreeService.createWorktreeWithNewBranch(
-      at: repository.path,
-      newBranchName: branchName,
-      directoryName: directoryName,
-      startPoint: baseBranch,
-      onProgress: onProgress
-    )
-
-    // Refresh to show the new worktree
-    refresh()
   }
 
   /// Deletes a worktree
@@ -906,6 +878,39 @@ public final class CLISessionsViewModel {
         message: "Failed to delete orphaned worktree: \(error.localizedDescription)"
       )
       deletingWorktreePath = nil
+    }
+  }
+
+  /// Deletes the worktree for a monitored session
+  /// - Parameter session: The session whose worktree to delete
+  public func deleteWorktreeForSession(_ session: CLISession) async {
+    deletingWorktreePath = session.projectPath
+    do {
+      try await worktreeService.removeWorktree(at: session.projectPath)
+      deletingWorktreePath = nil
+      stopMonitoring(session: session)
+      refresh()
+    } catch {
+      deletingWorktreePath = nil
+      let syntheticWorktree = WorktreeBranch(
+        name: session.branchName ?? session.projectPath,
+        path: session.projectPath,
+        isWorktree: true
+      )
+      if let orphanInfo = worktreeService.checkIfOrphaned(at: session.projectPath),
+         orphanInfo.isOrphaned {
+        worktreeDeletionError = WorktreeDeletionError(
+          worktree: syntheticWorktree,
+          message: error.localizedDescription,
+          isOrphaned: true,
+          parentRepoPath: orphanInfo.parentRepoPath
+        )
+      } else {
+        worktreeDeletionError = WorktreeDeletionError(
+          worktree: syntheticWorktree,
+          message: error.localizedDescription
+        )
+      }
     }
   }
 
@@ -1087,16 +1092,20 @@ public final class CLISessionsViewModel {
   /// - Parameters:
   ///   - worktree: The worktree to start the session in
   ///   - dangerouslySkipPermissions: If true, adds --dangerously-skip-permissions flag
-  public func startNewSessionInHub(_ worktree: WorktreeBranch, dangerouslySkipPermissions: Bool = false) {
+  public func startNewSessionInHub(
+    _ worktree: WorktreeBranch,
+    initialPrompt: String? = nil,
+    dangerouslySkipPermissions: Bool = false
+  ) {
     // Each pending session gets a unique ID, so no need to clear existing terminals
     // Terminals are now keyed by session ID, not worktree path
-    // No auto-prompt: let user type naturally in the terminal
     let pending = PendingHubSession(
       worktree: worktree,
-      initialPrompt: nil,
+      initialPrompt: initialPrompt,
       dangerouslySkipPermissions: dangerouslySkipPermissions
     )
     pendingHubSessions.append(pending)
+    lastCreatedPendingId = pending.id
 
 #if DEBUG
     let encodedPath = worktree.path.claudeProjectPathEncoded
@@ -1116,6 +1125,7 @@ public final class CLISessionsViewModel {
     let pendingKey = "pending-\(pending.id.uuidString)"
     removeTerminal(forKey: pendingKey)
     pendingHubSessions.removeAll { $0.id == pending.id }
+    resolvedPendingSessions.removeValue(forKey: pending.id)
   }
 
   /// Watches for a new session file for the active provider.
@@ -1285,6 +1295,8 @@ public final class CLISessionsViewModel {
              let session = matchingWorktree.sessions.first(where: { $0.id == sessionId }) {
             // Remove pending only after finding the real session
             pendingHubSessions.removeAll { $0.id == pending.id }
+            resolvedPendingSessions[pending.id] = session.id
+            AppLogger.session.info("[HandleNewSession] Resolved: pending=\(pending.id.uuidString.prefix(8), privacy: .public) -> real=\(session.id.prefix(8), privacy: .public)")
             // Transfer terminal from pending key to real session ID
             transferTerminal(fromPendingId: pending.id, toSessionId: session.id)
             // Keep terminal view visible during transition
@@ -1302,6 +1314,8 @@ public final class CLISessionsViewModel {
           for wt in repo.worktrees {
             if let session = wt.sessions.first(where: { $0.id == sessionId }) {
               pendingHubSessions.removeAll { $0.id == pending.id }
+              resolvedPendingSessions[pending.id] = session.id
+              AppLogger.session.info("[HandleNewSession] Resolved: pending=\(pending.id.uuidString.prefix(8), privacy: .public) -> real=\(session.id.prefix(8), privacy: .public)")
               // Transfer terminal from pending key to real session ID
               transferTerminal(fromPendingId: pending.id, toSessionId: session.id)
               // Keep terminal view visible during transition
@@ -1347,6 +1361,8 @@ public final class CLISessionsViewModel {
           }
 
           pendingHubSessions.removeAll { $0.id == pending.id }
+          resolvedPendingSessions[pending.id] = sessionId
+          AppLogger.session.info("[HandleNewSession] Resolved: pending=\(pending.id.uuidString.prefix(8), privacy: .public) -> real=\(sessionId.prefix(8), privacy: .public)")
           transferTerminal(fromPendingId: pending.id, toSessionId: sessionId)
           sessionsWithTerminalView.insert(sessionId)
           startMonitoring(session: newSession)
@@ -1383,6 +1399,8 @@ public final class CLISessionsViewModel {
           }
 
           pendingHubSessions.removeAll { $0.id == pending.id }
+          resolvedPendingSessions[pending.id] = sessionId
+          AppLogger.session.info("[HandleNewSession] Resolved: pending=\(pending.id.uuidString.prefix(8), privacy: .public) -> real=\(sessionId.prefix(8), privacy: .public)")
           transferTerminal(fromPendingId: pending.id, toSessionId: sessionId)
           sessionsWithTerminalView.insert(sessionId)
           startMonitoring(session: newSession)
@@ -1824,22 +1842,28 @@ public final class CLISessionsViewModel {
 
   // MARK: - Search Filter
 
-  /// Opens a folder picker to select a repository for filtering search results
+  /// Opens a folder picker to select a repository for filtering search results.
+  /// Uses asyncAfter to schedule NSOpenPanel creation on a future run loop iteration,
+  /// avoiding HIRunLoopSemaphore deadlock that occurs during GCD dispatch queue drain.
   public func showSearchFilterPicker() {
     #if canImport(AppKit)
-    let panel = NSOpenPanel()
-    panel.title = "Filter by Repository"
-    panel.message = "Select a repository to filter search results"
-    panel.canChooseFiles = false
-    panel.canChooseDirectories = true
-    panel.allowsMultipleSelection = false
-    panel.canCreateDirectories = false
+    DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+      MainActor.assumeIsolated {
+        let panel = NSOpenPanel()
+        panel.title = "Filter by Repository"
+        panel.message = "Select a repository to filter search results"
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.canCreateDirectories = false
 
-    if panel.runModal() == .OK, let url = panel.url {
-      searchFilterPath = url.path
-      // Re-run search with new filter if there's an active query
-      if !searchQuery.isEmpty {
-        performSearch()
+        if panel.runModal() == .OK, let url = panel.url {
+          self.searchFilterPath = url.path
+          // Re-run search with new filter if there's an active query
+          if !self.searchQuery.isEmpty {
+            self.performSearch()
+          }
+        }
       }
     }
     #endif

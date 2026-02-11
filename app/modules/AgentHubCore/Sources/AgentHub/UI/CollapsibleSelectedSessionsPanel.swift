@@ -19,6 +19,9 @@ public struct CollapsibleSelectedSessionsPanel: View {
   @AppStorage(AgentHubDefaults.selectedSessionsPanelSizeMode)
   private var sizeModeRawValue: Int = PanelSizeMode.small.rawValue
 
+  @State private var showDeleteWorktreeAlert = false
+  @State private var sessionToDeleteWorktree: CLISession? = nil
+
   private let headerHeight: CGFloat = 40
 
   private var sizeMode: PanelSizeMode {
@@ -74,6 +77,29 @@ public struct CollapsibleSelectedSessionsPanel: View {
       .onChange(of: items.map(\.id)) { _, _ in
         ensurePrimarySelection()
       }
+      .alert("Delete Worktree?", isPresented: $showDeleteWorktreeAlert) {
+        Button("Cancel", role: .cancel) {
+          sessionToDeleteWorktree = nil
+        }
+        Button("Delete", role: .destructive) {
+          if let session = sessionToDeleteWorktree {
+            let providerKind = items.first(where: { $0.session.id == session.id })?.providerKind
+            Task {
+              switch providerKind {
+              case .claude:
+                await claudeViewModel.deleteWorktreeForSession(session)
+              case .codex:
+                await codexViewModel.deleteWorktreeForSession(session)
+              case .none:
+                break
+              }
+            }
+            sessionToDeleteWorktree = nil
+          }
+        }
+      } message: {
+        Text("You are about to delete this worktree. This cannot be recovered.")
+      }
     }
   }
 
@@ -122,10 +148,28 @@ public struct CollapsibleSelectedSessionsPanel: View {
             isPending: item.isPending,
             isPrimary: item.id == primarySessionId,
             customName: customName(for: item),
-            colorScheme: colorScheme
-          ) {
-            primarySessionId = item.id
-          }
+            sessionStatus: item.sessionStatus,
+            colorScheme: colorScheme,
+            onArchive: item.isPending ? nil : {
+              switch item.providerKind {
+              case .claude: claudeViewModel.stopMonitoring(session: item.session)
+              case .codex: codexViewModel.stopMonitoring(session: item.session)
+              }
+            },
+            onDeleteWorktree: (!item.isPending && item.session.isWorktree) ? {
+              sessionToDeleteWorktree = item.session
+              showDeleteWorktreeAlert = true
+            } : nil,
+            isDeletingWorktree: item.session.isWorktree && {
+              switch item.providerKind {
+              case .claude: return claudeViewModel.deletingWorktreePath == item.session.projectPath
+              case .codex: return codexViewModel.deletingWorktreePath == item.session.projectPath
+              }
+            }(),
+            onSelect: {
+              primarySessionId = item.id
+            }
+          )
         }
       }
       .padding(.horizontal, 4)
@@ -141,6 +185,7 @@ public struct CollapsibleSelectedSessionsPanel: View {
     let providerKind: SessionProviderKind
     let timestamp: Date
     let isPending: Bool
+    let sessionStatus: SessionStatus?
   }
 
   private var items: [SelectedSessionItem] {
@@ -152,7 +197,8 @@ public struct CollapsibleSelectedSessionsPanel: View {
         session: pending.placeholderSession,
         providerKind: .claude,
         timestamp: pending.startedAt,
-        isPending: true
+        isPending: true,
+        sessionStatus: nil
       ))
     }
 
@@ -162,7 +208,8 @@ public struct CollapsibleSelectedSessionsPanel: View {
         session: pending.placeholderSession,
         providerKind: .codex,
         timestamp: pending.startedAt,
-        isPending: true
+        isPending: true,
+        sessionStatus: nil
       ))
     }
 
@@ -171,8 +218,9 @@ public struct CollapsibleSelectedSessionsPanel: View {
         id: "claude-\(item.session.id)",
         session: item.session,
         providerKind: .claude,
-        timestamp: item.state?.lastActivityAt ?? item.session.lastActivityAt,
-        isPending: false
+        timestamp: item.session.lastActivityAt,
+        isPending: false,
+        sessionStatus: item.state?.status
       ))
     }
 
@@ -181,8 +229,9 @@ public struct CollapsibleSelectedSessionsPanel: View {
         id: "codex-\(item.session.id)",
         session: item.session,
         providerKind: .codex,
-        timestamp: item.state?.lastActivityAt ?? item.session.lastActivityAt,
-        isPending: false
+        timestamp: item.session.lastActivityAt,
+        isPending: false,
+        sessionStatus: item.state?.status
       ))
     }
 
@@ -222,6 +271,9 @@ public struct SingleProviderCollapsibleSelectedSessionsPanel: View {
 
   @AppStorage(AgentHubDefaults.selectedSessionsPanelSizeMode)
   private var sizeModeRawValue: Int = PanelSizeMode.small.rawValue
+
+  @State private var showDeleteWorktreeAlert = false
+  @State private var sessionToDeleteWorktree: CLISession? = nil
 
   private let headerHeight: CGFloat = 40
 
@@ -273,6 +325,21 @@ public struct SingleProviderCollapsibleSelectedSessionsPanel: View {
       .onChange(of: items.map(\.id)) { _, _ in
         ensurePrimarySelection()
       }
+      .alert("Delete Worktree?", isPresented: $showDeleteWorktreeAlert) {
+        Button("Cancel", role: .cancel) {
+          sessionToDeleteWorktree = nil
+        }
+        Button("Delete", role: .destructive) {
+          if let session = sessionToDeleteWorktree {
+            Task {
+              await viewModel.deleteWorktreeForSession(session)
+            }
+            sessionToDeleteWorktree = nil
+          }
+        }
+      } message: {
+        Text("You are about to delete this worktree. This cannot be recovered.")
+      }
     }
   }
 
@@ -321,10 +388,21 @@ public struct SingleProviderCollapsibleSelectedSessionsPanel: View {
             isPending: item.isPending,
             isPrimary: item.id == primarySessionId,
             customName: viewModel.sessionCustomNames[item.session.id],
-            colorScheme: colorScheme
-          ) {
-            primarySessionId = item.id
-          }
+            sessionStatus: item.sessionStatus,
+            colorScheme: colorScheme,
+            onArchive: item.isPending ? nil : {
+              viewModel.stopMonitoring(session: item.session)
+            },
+            onDeleteWorktree: (!item.isPending && item.session.isWorktree) ? {
+              sessionToDeleteWorktree = item.session
+              showDeleteWorktreeAlert = true
+            } : nil,
+            isDeletingWorktree: item.session.isWorktree
+              && viewModel.deletingWorktreePath == item.session.projectPath,
+            onSelect: {
+              primarySessionId = item.id
+            }
+          )
         }
       }
       .padding(.horizontal, 4)
@@ -339,6 +417,7 @@ public struct SingleProviderCollapsibleSelectedSessionsPanel: View {
     let session: CLISession
     let timestamp: Date
     let isPending: Bool
+    let sessionStatus: SessionStatus?
   }
 
   private var items: [SelectedSessionItem] {
@@ -349,7 +428,8 @@ public struct SingleProviderCollapsibleSelectedSessionsPanel: View {
         id: "pending-\(pending.id.uuidString)",
         session: pending.placeholderSession,
         timestamp: pending.startedAt,
-        isPending: true
+        isPending: true,
+        sessionStatus: nil
       ))
     }
 
@@ -357,8 +437,9 @@ public struct SingleProviderCollapsibleSelectedSessionsPanel: View {
       results.append(SelectedSessionItem(
         id: item.session.id,
         session: item.session,
-        timestamp: item.state?.lastActivityAt ?? item.session.lastActivityAt,
-        isPending: false
+        timestamp: item.session.lastActivityAt,
+        isPending: false,
+        sessionStatus: item.state?.status
       ))
     }
 
@@ -379,88 +460,3 @@ public struct SingleProviderCollapsibleSelectedSessionsPanel: View {
   }
 }
 
-// MARK: - CollapsibleSessionRow
-
-private struct CollapsibleSessionRow: View {
-  let session: CLISession
-  let providerKind: SessionProviderKind
-  let timestamp: Date
-  let isPending: Bool
-  let isPrimary: Bool
-  let customName: String?
-  let colorScheme: ColorScheme
-  let onSelect: () -> Void
-
-  var body: some View {
-    HStack(spacing: 8) {
-      Circle()
-        .fill(Color.brandPrimary(for: providerKind))
-        .frame(width: 6, height: 6)
-
-      VStack(alignment: .leading, spacing: 2) {
-        HStack(spacing: 4) {
-          if let customName {
-            Text(customName)
-              .font(.system(.caption, design: .monospaced, weight: .medium))
-              .lineLimit(1)
-          } else if let slug = session.slug {
-            Text(slug)
-              .font(.system(.caption, design: .monospaced, weight: .medium))
-              .lineLimit(1)
-          } else {
-            Text(session.shortId)
-              .font(.system(.caption, design: .monospaced, weight: .medium))
-              .lineLimit(1)
-          }
-
-          if isPending {
-            Text("Starting")
-              .font(.system(size: 9))
-              .foregroundColor(.secondary)
-              .padding(.horizontal, 4)
-              .padding(.vertical, 1)
-              .background(Color.secondary.opacity(0.12))
-              .clipShape(RoundedRectangle(cornerRadius: 3))
-          }
-        }
-
-        HStack(spacing: 4) {
-          if let branch = session.branchName {
-            Text(branch)
-              .font(.system(size: 10))
-              .foregroundColor(isPrimary ? .primary.opacity(0.7) : .secondary)
-              .lineLimit(1)
-          }
-
-          Text(timestamp.timeAgoDisplay())
-            .font(.system(size: 10))
-            .foregroundColor(isPrimary ? .primary.opacity(0.5) : .secondary.opacity(0.7))
-        }
-
-        // First message preview
-        if let message = session.firstMessage, !message.isEmpty {
-          Text(message.prefix(80) + (message.count > 80 ? "..." : ""))
-            .font(.caption)
-            .foregroundColor(.primary.opacity(0.8))
-            .lineLimit(1)
-        }
-      }
-
-      Spacer()
-
-      Text(providerKind.rawValue)
-        .font(.system(size: 9, weight: .medium))
-        .foregroundColor(.brandPrimary(for: providerKind))
-    }
-    .padding(.vertical, 6)
-    .padding(.horizontal, 8)
-    .foregroundColor(.primary)
-    .contentShape(Rectangle())
-    .onTapGesture { onSelect() }
-    .background(
-      colorScheme == .dark
-        ? (isPrimary ? AnyShapeStyle(.thickMaterial) : AnyShapeStyle(Color.clear))
-        : (isPrimary ? AnyShapeStyle(Color.white) : AnyShapeStyle(.thickMaterial))
-    )
-  }
-}

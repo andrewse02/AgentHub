@@ -16,10 +16,6 @@ public struct CLIWorktreeBranchRow: View {
   let isExpanded: Bool
   let providerKind: SessionProviderKind
   let onToggleExpanded: () -> Void
-  let onOpenTerminal: () -> Void
-  let onOpenTerminalDangerous: () -> Void
-  let onStartInHub: () -> Void
-  let onStartInHubDangerous: () -> Void
   let onDeleteWorktree: (() -> Void)?
   let onConnectSession: (CLISession) -> Void
   let onCopySessionId: (CLISession) -> Void
@@ -32,7 +28,6 @@ public struct CLIWorktreeBranchRow: View {
   var isDeleting: Bool = false
 
   @State private var visibleSessionCount: Int = 5
-  @State private var showNewSessionMenu: Bool = false
 
   // Initial visible sessions and load increment
   private let initialVisibleSessions = 5
@@ -65,23 +60,11 @@ public struct CLIWorktreeBranchRow: View {
     remainingSessions > 0
   }
 
-  private var providerLabel: String {
-    providerKind.rawValue
-  }
-
-  private var supportsExternalTerminal: Bool {
-    providerKind == .claude
-  }
-
   public init(
     worktree: WorktreeBranch,
     isExpanded: Bool,
     providerKind: SessionProviderKind = .claude,
     onToggleExpanded: @escaping () -> Void,
-    onOpenTerminal: @escaping () -> Void,
-    onOpenTerminalDangerous: @escaping () -> Void = {},
-    onStartInHub: @escaping () -> Void,
-    onStartInHubDangerous: @escaping () -> Void = {},
     onDeleteWorktree: (() -> Void)? = nil,
     onConnectSession: @escaping (CLISession) -> Void,
     onCopySessionId: @escaping (CLISession) -> Void,
@@ -97,10 +80,6 @@ public struct CLIWorktreeBranchRow: View {
     self.isExpanded = isExpanded
     self.providerKind = providerKind
     self.onToggleExpanded = onToggleExpanded
-    self.onOpenTerminal = onOpenTerminal
-    self.onOpenTerminalDangerous = onOpenTerminalDangerous
-    self.onStartInHub = onStartInHub
-    self.onStartInHubDangerous = onStartInHubDangerous
     self.onDeleteWorktree = onDeleteWorktree
     self.onConnectSession = onConnectSession
     self.onCopySessionId = onCopySessionId
@@ -187,84 +166,6 @@ public struct CLIWorktreeBranchRow: View {
             }
           }
 
-          // New session button with menu
-          Button(action: { showNewSessionMenu.toggle() }) {
-            Image(systemName: "plus")
-              .font(.caption)
-              .foregroundColor(.primary)
-              .frame(width: 24, height: 24)
-              .background(
-                RoundedRectangle(cornerRadius: 6, style: .continuous)
-                  .stroke(Color.secondary.opacity(0.3), lineWidth: 1)
-              )
-              .contentShape(Rectangle())
-          }
-          .buttonStyle(.plain)
-          .help("Start new \(providerLabel) session")
-          .popover(isPresented: $showNewSessionMenu, arrowEdge: .bottom) {
-            VStack(alignment: .leading, spacing: 0) {
-              // Start in Hub (Recommended)
-              Button(action: {
-                showNewSessionMenu = false
-                onStartInHub()
-              }) {
-                Label("Start in Hub (Recommended)", systemImage: "square.grid.2x2")
-                  .frame(maxWidth: .infinity, alignment: .leading)
-                  .foregroundColor(.primary)
-              }
-              .buttonStyle(.plain)
-              .padding(.horizontal, 12)
-              .padding(.vertical, 8)
-              .contentShape(Rectangle())
-
-              // Start in Hub (Dangerously)
-              Button(action: {
-                showNewSessionMenu = false
-                onStartInHubDangerous()
-              }) {
-                Label("Start in Hub (Dangerously)", systemImage: "exclamationmark.triangle")
-                  .frame(maxWidth: .infinity, alignment: .leading)
-                  .foregroundColor(.orange)
-              }
-              .buttonStyle(.plain)
-              .padding(.horizontal, 12)
-              .padding(.vertical, 8)
-              .contentShape(Rectangle())
-
-              if supportsExternalTerminal {
-                Divider()
-
-                // Open in Terminal (Recommended)
-                Button(action: {
-                  showNewSessionMenu = false
-                  onOpenTerminal()
-                }) {
-                  Label("Open in Terminal (Recommended)", systemImage: "terminal")
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                }
-                .buttonStyle(.plain)
-                .padding(.horizontal, 12)
-                .padding(.vertical, 8)
-                .contentShape(Rectangle())
-
-                // Open in Terminal (Dangerously)
-                Button(action: {
-                  showNewSessionMenu = false
-                  onOpenTerminalDangerous()
-                }) {
-                  Label("Open in Terminal (Dangerously)", systemImage: "exclamationmark.triangle")
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .foregroundColor(.orange)
-                }
-                .buttonStyle(.plain)
-                .padding(.horizontal, 12)
-                .padding(.vertical, 8)
-                .contentShape(Rectangle())
-              }
-            }
-            .padding(.vertical, 8)
-            .frame(width: 260)
-          }
         }
         .padding(.vertical, 14)
         .padding(.horizontal, 4)
@@ -353,8 +254,6 @@ public struct CLIWorktreeBranchRow: View {
       ),
       isExpanded: true,
       onToggleExpanded: {},
-      onOpenTerminal: {},
-      onStartInHub: {},
       onConnectSession: { _ in },
       onCopySessionId: { _ in },
       onOpenSessionFile: { _ in },
@@ -384,8 +283,6 @@ public struct CLIWorktreeBranchRow: View {
       ),
       isExpanded: false,
       onToggleExpanded: {},
-      onOpenTerminal: {},
-      onStartInHub: {},
       onConnectSession: { _ in },
       onCopySessionId: { _ in },
       onOpenSessionFile: { _ in },
@@ -405,8 +302,6 @@ public struct CLIWorktreeBranchRow: View {
       ),
       isExpanded: true,
       onToggleExpanded: {},
-      onOpenTerminal: {},
-      onStartInHub: {},
       onConnectSession: { _ in },
       onCopySessionId: { _ in },
       onOpenSessionFile: { _ in },

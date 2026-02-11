@@ -8,6 +8,7 @@
 import SwiftUI
 import PierreDiffsSwift
 import ClaudeCodeSDK
+import os
 
 // MARK: - GitDiffView
 
@@ -28,6 +29,7 @@ public struct GitDiffView: View {
   let cliConfiguration: CLICommandConfiguration?
   let providerKind: SessionProviderKind
   let onInlineRequestSubmit: ((String, CLISession) -> Void)?
+  var isEmbedded: Bool = false
 
   /// Inline editor is enabled when either claudeClient or cliConfiguration is available
   private var isInlineEditorEnabled: Bool {
@@ -50,6 +52,7 @@ public struct GitDiffView: View {
   @State private var commentsState = DiffCommentsState()
   @State private var showDiscardCommentsAlert = false
   @State private var expandedPaths: Set<String> = []
+  @State private var showSidebar: Bool = true
   @State private var treeCommonPrefix: String = ""
 
   private let gitDiffService = GitDiffService()
@@ -61,7 +64,8 @@ public struct GitDiffView: View {
     claudeClient: (any ClaudeCode)? = nil,
     cliConfiguration: CLICommandConfiguration? = nil,
     providerKind: SessionProviderKind = .claude,
-    onInlineRequestSubmit: ((String, CLISession) -> Void)? = nil
+    onInlineRequestSubmit: ((String, CLISession) -> Void)? = nil,
+    isEmbedded: Bool = false
   ) {
     self.session = session
     self.projectPath = projectPath
@@ -70,6 +74,7 @@ public struct GitDiffView: View {
     self.cliConfiguration = cliConfiguration
     self.providerKind = providerKind
     self.onInlineRequestSubmit = onInlineRequestSubmit
+    self.isEmbedded = isEmbedded
   }
 
   public var body: some View {
@@ -88,14 +93,18 @@ public struct GitDiffView: View {
         emptyState
       } else {
         VStack(spacing: 0) {
-          HSplitView {
-            // File list sidebar
-            fileListSidebar
-              .frame(minWidth: 200, idealWidth: 250, maxWidth: 300)
+          HStack(spacing: 0) {
+            if showSidebar {
+              // File list sidebar
+              fileListSidebar
+                .frame(width: computedSidebarWidth)
+              Divider()
+            }
 
             // Diff viewer
             diffViewer
           }
+          .animation(.easeInOut(duration: 0.25), value: showSidebar)
 
           // Comments panel (shown when there are comments)
           if commentsState.hasComments {
@@ -108,8 +117,10 @@ public struct GitDiffView: View {
         }
       }
     }
-    .frame(minWidth: 1200, idealWidth: .infinity, maxWidth: .infinity,
-           minHeight: 800, idealHeight: .infinity, maxHeight: .infinity)
+    .frame(
+      minWidth: isEmbedded ? 400 : 1200, idealWidth: .infinity, maxWidth: .infinity,
+      minHeight: isEmbedded ? 400 : 800, idealHeight: .infinity, maxHeight: .infinity
+    )
     .onKeyPress(.escape) {
       if inlineEditorState.isShowing {
         withAnimation(.easeOut(duration: 0.15)) {
@@ -148,17 +159,6 @@ public struct GitDiffView: View {
   private var header: some View {
     HStack {
       HStack(spacing: 8) {
-        Image(systemName: "arrow.left.arrow.right")
-          .font(.title3)
-          .foregroundColor(.brandPrimary(for: providerKind))
-
-        Text("Git Diff")
-          .font(.title3.weight(.semibold))
-
-        Text("(\(diffState.fileCount) files)")
-          .font(.title3)
-          .foregroundColor(.secondary)
-
         // Comment count badge
         if commentsState.hasComments {
           HStack(spacing: 4) {
@@ -177,23 +177,6 @@ public struct GitDiffView: View {
         }
       }
 
-      Spacer()
-
-      // Mode segmented control
-      Picker("Diff Mode", selection: $diffMode) {
-        ForEach(DiffMode.allCases) { mode in
-          Label(mode.rawValue, systemImage: mode.icon)
-            .tag(mode)
-        }
-      }
-      .pickerStyle(.segmented)
-      .frame(width: 280)
-      .onChange(of: diffMode) { _, newMode in
-        Task { await loadChanges(for: newMode) }
-      }
-
-      Spacer()
-
       // Session info
       HStack(spacing: 8) {
         Text(session.shortId)
@@ -208,6 +191,19 @@ public struct GitDiffView: View {
       }
 
       Spacer()
+
+      // Segmented control
+      Picker("", selection: $diffMode) {
+        ForEach(DiffMode.allCases) { mode in
+          Text(mode.rawValue).tag(mode)
+        }
+      }
+      .pickerStyle(.segmented)
+      .frame(width: 250)
+      .tint(Color.primary)
+      .onChange(of: diffMode) { _, newMode in
+        Task { await loadChanges(for: newMode) }
+      }
 
       Button("Close") {
         if commentsState.hasComments {
@@ -393,12 +389,36 @@ public struct GitDiffView: View {
       }
   }
 
+  /// Computes the ideal sidebar width based on the deepest/widest node in the tree
+  private var computedSidebarWidth: CGFloat {
+    let (maxDepth, longestName) = measureTree(nodes: fileTree, depth: 0)
+    // ~7pt per character for monospaced caption font
+    let nameWidth = CGFloat(longestName) * 7
+    // padding(8) + depth*10 + chevron(12) + icon(16) + spacing(4) + name + spacing(4) + changeCounts(~50) + padding(8)
+    let idealWidth = 8 + CGFloat(maxDepth) * 10 + 12 + 16 + 4 + nameWidth + 4 + 50 + 8
+    return min(max(idealWidth, 220), 400)
+  }
+
+  private func measureTree(nodes: [FileTreeNode], depth: Int) -> (maxDepth: Int, longestName: Int) {
+    var maxDepth = depth
+    var longestName = 0
+    for node in nodes {
+      longestName = max(longestName, node.name.count)
+      if !node.children.isEmpty {
+        let (childDepth, childName) = measureTree(nodes: node.children, depth: depth + 1)
+        maxDepth = max(maxDepth, childDepth)
+        longestName = max(longestName, childName)
+      }
+    }
+    return (maxDepth, longestName)
+  }
+
   private var fileListSidebar: some View {
     VStack(alignment: .leading, spacing: 0) {
       // Header
       HStack {
         Text("Changes")
-          .font(.headline)
+            .font(.system(size: 13, weight: .bold, design: .monospaced))
         Spacer()
       }
       .padding()
@@ -479,6 +499,9 @@ public struct GitDiffView: View {
             newContent: contents.new,
             fileName: file.fileName,
             filePath: file.filePath,
+            projectPath: projectPath,
+            isWebRenderable: file.isWebRenderable,
+            showSidebar: $showSidebar,
             diffStyle: $diffStyle,
             overflowMode: $overflowMode,
             inlineEditorState: inlineEditorState,
@@ -509,6 +532,9 @@ public struct GitDiffView: View {
   // MARK: - Data Loading
 
   private func loadChanges(for mode: DiffMode) async {
+    let clock = ContinuousClock()
+    let totalStart = clock.now
+
     // Clear existing state when switching modes
     await MainActor.run {
       isLoading = true
@@ -526,21 +552,29 @@ public struct GitDiffView: View {
     do {
       // Detect base branch for branch mode (cache it for later use)
       if mode == .branch && detectedBaseBranch == nil {
+        let branchStart = clock.now
         detectedBaseBranch = try await gitDiffService.detectBaseBranch(at: projectPath)
+        AppLogger.git.info("[perf] detectBaseBranch: \(clock.now - branchStart)")
       }
 
+      let gitRootStart = clock.now
       let gitRoot = try await gitDiffService.findGitRoot(at: projectPath)
+      AppLogger.git.info("[perf] findGitRoot: \(clock.now - gitRootStart)")
 
       // Get unified diff in ONE command (fast path)
+      let diffStart = clock.now
       let unifiedDiff = try await gitDiffService.getUnifiedDiffOutput(
         at: projectPath,
         mode: mode,
         baseBranch: detectedBaseBranch
       )
+      AppLogger.git.info("[perf] getUnifiedDiffOutput: \(clock.now - diffStart)")
 
       // Parse all tracked file diffs upfront
+      let parseStart = clock.now
       let parsed = DiffParserUtils.parse(diffOutput: unifiedDiff)
-      var entries = DiffParserUtils.toGitDiffFileEntries(parsed, gitRoot: gitRoot)
+      let entries = DiffParserUtils.toGitDiffFileEntries(parsed, gitRoot: gitRoot)
+      AppLogger.git.info("[perf] parse+toEntries: \(clock.now - parseStart)")
 
       // Build lookup for parsed content by matching relativePath
       var parsedLookup: [UUID: ParsedFileDiff] = [:]
@@ -548,13 +582,6 @@ public struct GitDiffView: View {
         if let entry = entries.first(where: { $0.relativePath == diff.filePath }) {
           parsedLookup[entry.id] = diff
         }
-      }
-
-      // HYBRID: For unstaged mode, also get untracked files (not included in git diff)
-      if mode == .unstaged {
-        let untrackedEntries = try await fetchUntrackedFiles(gitRoot: gitRoot)
-        entries.append(contentsOf: untrackedEntries)
-        // Note: untracked files won't be in parsedLookup, so they'll use fallback
       }
 
       await MainActor.run {
@@ -580,75 +607,14 @@ public struct GitDiffView: View {
         }
       }
 
+      AppLogger.git.info("[perf] loadChanges total (\(mode.rawValue)): \(clock.now - totalStart)")
+
     } catch {
       await MainActor.run {
         errorMessage = error.localizedDescription
         isLoading = false
       }
     }
-  }
-
-  /// Fetches untracked files from git status --porcelain
-  private func fetchUntrackedFiles(gitRoot: String) async throws -> [GitDiffFileEntry] {
-    let process = Process()
-    process.executableURL = URL(fileURLWithPath: "/usr/bin/git")
-    process.arguments = ["status", "--porcelain", "-uall"]
-    process.currentDirectoryURL = URL(fileURLWithPath: gitRoot)
-
-    let outputPipe = Pipe()
-    process.standardOutput = outputPipe
-    process.standardError = Pipe()
-
-    try process.run()
-    process.waitUntilExit()
-
-    let data = try outputPipe.fileHandleForReading.readToEnd() ?? Data()
-    let output = String(data: data, encoding: .utf8) ?? ""
-
-    var untrackedPaths: [(relativePath: String, fullPath: String)] = []
-
-    let lines = output.components(separatedBy: "\n").filter { !$0.isEmpty }
-    for line in lines {
-      guard line.count > 3 else { continue }
-      let statusCode = String(line.prefix(2))
-      let filePath = String(line.dropFirst(3))
-
-      // "??" means untracked file
-      if statusCode == "??" {
-        let fullPath = (gitRoot as NSString).appendingPathComponent(filePath)
-        untrackedPaths.append((relativePath: filePath, fullPath: fullPath))
-      }
-    }
-
-    // Count lines in parallel for untracked files
-    return await withTaskGroup(of: GitDiffFileEntry.self) { group in
-      for (relativePath, fullPath) in untrackedPaths {
-        group.addTask {
-          let lineCount = await self.countLinesInFile(at: fullPath)
-          return GitDiffFileEntry(
-            filePath: fullPath,
-            relativePath: relativePath,
-            additions: lineCount,
-            deletions: 0
-          )
-        }
-      }
-
-      var results: [GitDiffFileEntry] = []
-      for await entry in group {
-        results.append(entry)
-      }
-      return results
-    }
-  }
-
-  /// Counts lines in a file
-  private func countLinesInFile(at path: String) async -> Int {
-    guard let data = FileManager.default.contents(atPath: path),
-          let content = String(data: data, encoding: .utf8) else {
-      return 0
-    }
-    return content.components(separatedBy: .newlines).count
   }
 
   private func loadFileDiff(for file: GitDiffFileEntry, mode: DiffMode? = nil) {
@@ -774,7 +740,7 @@ private struct FileTreeNodeRow: View {
           // Indentation based on depth
           if depth > 0 {
             Spacer()
-              .frame(width: CGFloat(depth) * 16)
+              .frame(width: CGFloat(depth) * 10)
           }
 
           // Chevron (folders only)
@@ -791,7 +757,7 @@ private struct FileTreeNodeRow: View {
           // Icon
           Image(systemName: node.isFolder ? "folder.fill" : "doc.text")
             .font(.caption)
-            .foregroundColor(node.isFolder ? .yellow : .blue)
+            .foregroundColor(node.isFolder ? .secondary : .blue)
             .frame(width: 16)
 
           // Name
@@ -800,7 +766,7 @@ private struct FileTreeNodeRow: View {
             .fontWeight(node.isFolder ? .medium : .regular)
             .lineLimit(1)
 
-          Spacer()
+          Spacer(minLength: 4)
 
           // Change counts (files only)
           if let file = node.file {
@@ -933,7 +899,10 @@ private struct GitDiffContentView: View {
   let newContent: String
   let fileName: String
   let filePath: String
+  let projectPath: String
+  let isWebRenderable: Bool
 
+  @Binding var showSidebar: Bool
   @Binding var diffStyle: DiffStyle
   @Binding var overflowMode: OverflowMode
   @Bindable var inlineEditorState: InlineEditorState
@@ -947,6 +916,10 @@ private struct GitDiffContentView: View {
 
   @State private var webViewOpacity: Double = 1.0
   @State private var isWebViewReady = false
+  @State private var isWindowTransitioning = false
+  @State private var showPreview: Bool = false
+  @State private var previewLoading: Bool = false
+  @State private var previewCurrentURL: URL?
 
   /// Inline editor is enabled when either claudeClient or cliConfiguration is available
   private var isInlineEditorEnabled: Bool {
@@ -959,41 +932,58 @@ private struct GitDiffContentView: View {
       // Header with file info and controls
       headerView
 
+      // Web preview or diff view
+      if showPreview {
+        WebPreviewWebView(
+          url: URL(fileURLWithPath: filePath),
+          isFileURL: true,
+          allowingReadAccessTo: URL(fileURLWithPath: projectPath),
+          isLoading: $previewLoading,
+          currentURL: $previewCurrentURL,
+          onError: nil
+        )
+      } else {
       // Diff view with inline editor overlay
       GeometryReader { geometry in
         ZStack {
-          PierreDiffView(
-            oldContent: oldContent,
-            newContent: newContent,
-            fileName: fileName,
-            diffStyle: $diffStyle,
-            overflowMode: $overflowMode,
-            onLineClickWithPosition: isInlineEditorEnabled ? { position, localPoint in
-              print("[GitDiffContentView] Line clicked! lineNumber=\(position.lineNumber), side=\(position.side)")
-              let anchorPoint = CGPoint(x: geometry.size.width / 2, y: localPoint.y)
+          if isWindowTransitioning {
+            // Static placeholder during window transition to prevent WKWebView crash
+            Color.clear
+              .frame(maxWidth: .infinity, maxHeight: .infinity)
+          } else {
+            PierreDiffView(
+              oldContent: oldContent,
+              newContent: newContent,
+              fileName: fileName,
+              diffStyle: $diffStyle,
+              overflowMode: $overflowMode,
+              onLineClickWithPosition: isInlineEditorEnabled ? { position, localPoint in
+                print("[GitDiffContentView] Line clicked! lineNumber=\(position.lineNumber), side=\(position.side)")
+                let anchorPoint = CGPoint(x: geometry.size.width / 2, y: localPoint.y)
 
-              // Determine which content to use based on the side (left=old, right=new)
-              let fileContent = position.side == "left" ? oldContent : newContent
-              let lineContent = extractLine(from: fileContent, lineNumber: position.lineNumber)
+                // Determine which content to use based on the side (left=old, right=new)
+                let fileContent = position.side == "left" ? oldContent : newContent
+                let lineContent = extractLine(from: fileContent, lineNumber: position.lineNumber)
 
-              withAnimation(.easeOut(duration: 0.2)) {
-                inlineEditorState.show(
-                  at: anchorPoint,
-                  lineNumber: position.lineNumber,
-                  side: position.side,
-                  fileName: filePath,
-                  lineContent: lineContent,
-                  fullFileContent: fileContent
-                )
+                withAnimation(.easeOut(duration: 0.2)) {
+                  inlineEditorState.show(
+                    at: anchorPoint,
+                    lineNumber: position.lineNumber,
+                    side: position.side,
+                    fileName: filePath,
+                    lineContent: lineContent,
+                    fullFileContent: fileContent
+                  )
+                }
+              } : nil,
+              onReady: {
+                withAnimation(.easeInOut(duration: 0.3)) {
+                  isWebViewReady = true
+                }
               }
-            } : nil,
-            onReady: {
-              withAnimation(.easeInOut(duration: 0.3)) {
-                isWebViewReady = true
-              }
-            }
-          )
-          .opacity(isWebViewReady ? webViewOpacity : 0)
+            )
+            .opacity(isWebViewReady ? webViewOpacity : 0)
+          }
 
           if !isWebViewReady {
             VStack(spacing: 12) {
@@ -1074,12 +1064,46 @@ private struct GitDiffContentView: View {
         }
       }
       .animation(.easeInOut(duration: 0.3), value: isWebViewReady)
+      } // else (diff view)
+    }
+    .onReceive(NotificationCenter.default.publisher(for: NSWindow.willEnterFullScreenNotification)) { _ in
+      isWindowTransitioning = true
+    }
+    .onReceive(NotificationCenter.default.publisher(for: NSWindow.didEnterFullScreenNotification)) { _ in
+      Task { @MainActor in
+        try? await Task.sleep(for: .milliseconds(100))
+        isWindowTransitioning = false
+      }
+    }
+    .onReceive(NotificationCenter.default.publisher(for: NSWindow.willExitFullScreenNotification)) { _ in
+      isWindowTransitioning = true
+    }
+    .onReceive(NotificationCenter.default.publisher(for: NSWindow.didExitFullScreenNotification)) { _ in
+      Task { @MainActor in
+        try? await Task.sleep(for: .milliseconds(100))
+        isWindowTransitioning = false
+      }
+    }
+    .onChange(of: isWindowTransitioning) { _, newValue in
+      if newValue {
+        isWebViewReady = false
+      }
     }
   }
 
   private var headerView: some View {
     VStack(alignment: .leading) {
       HStack {
+        Button {
+          showSidebar.toggle()
+        } label: {
+          Image(systemName: "sidebar.left")
+            .font(.system(size: 14))
+            .foregroundStyle(showSidebar ? .primary : .secondary)
+        }
+        .buttonStyle(.plain)
+        .help(showSidebar ? "Hide file list" : "Show file list")
+
         // File name with icon
         HStack {
           Image(systemName: "doc.text.fill")
@@ -1087,6 +1111,16 @@ private struct GitDiffContentView: View {
           Text(fileName)
             .font(.headline)
         }
+
+        // TODO: Revisit Code/Preview toggle for web-renderable files
+        // if isWebRenderable {
+        //   Picker("", selection: $showPreview) {
+        //     Text("Code").tag(false)
+        //     Text("Preview").tag(true)
+        //   }
+        //   .pickerStyle(.segmented)
+        //   .frame(width: 140)
+        // }
 
         Spacer()
 

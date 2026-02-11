@@ -10,6 +10,26 @@ import Foundation
 import PierreDiffsSwift
 import SwiftUI
 
+// MARK: - SidePanelContent
+
+private enum SidePanelContent: Equatable {
+  case diff(sessionId: String, session: CLISession, projectPath: String)
+  case plan(sessionId: String, session: CLISession, planState: PlanState)
+  case webPreview(sessionId: String, session: CLISession, projectPath: String)
+
+  static func == (lhs: SidePanelContent, rhs: SidePanelContent) -> Bool {
+    switch (lhs, rhs) {
+    case (.diff(let id1, _, let p1), .diff(let id2, _, let p2)):
+      return id1 == id2 && p1 == p2
+    case (.plan(let id1, _, _), .plan(let id2, _, _)):
+      return id1 == id2
+    case (.webPreview(let id1, _, let p1), .webPreview(let id2, _, let p2)):
+      return id1 == id2 && p1 == p2
+    default: return false
+    }
+  }
+}
+
 // MARK: - SessionFileSheetItem
 
 private struct SessionFileSheetItem: Identifiable {
@@ -167,7 +187,7 @@ enum ProviderMonitoringItem: Identifiable {
     case .pending(_, _, let pending):
       return pending.startedAt
     case .monitored(_, _, let session, let state):
-      return state?.lastActivityAt ?? session.lastActivityAt
+      return session.lastActivityAt
     }
   }
 
@@ -194,7 +214,9 @@ public struct MultiProviderMonitoringPanelView: View {
 
   @State private var sessionFileSheetItem: SessionFileSheetItem?
   @State private var maximizedSessionId: String?
+  @State private var sidePanelContent: SidePanelContent?
   @State private var filterMode: HubFilterMode = .all
+  @State private var availableDetailWidth: CGFloat = 0
   @Binding var primarySessionId: String?
   @AppStorage(AgentHubDefaults.hubLayoutMode)
   private var layoutModeRawValue: Int = LayoutMode.single.rawValue
@@ -202,6 +224,10 @@ public struct MultiProviderMonitoringPanelView: View {
 
   private var layoutMode: LayoutMode {
     get { LayoutMode(rawValue: layoutModeRawValue) ?? .single }
+  }
+
+  private var canShowSidePanel: Bool {
+    availableDetailWidth >= 900
   }
 
   public init(
@@ -266,6 +292,16 @@ public struct MultiProviderMonitoringPanelView: View {
         filterMode = .all
       }
     }
+    .onChange(of: effectivePrimarySessionId) { _, _ in
+      sidePanelContent = nil
+    }
+    .onChange(of: canShowSidePanel) { _, canShow in
+      if !canShow {
+        withAnimation(.easeInOut(duration: 0.25)) {
+          sidePanelContent = nil
+        }
+      }
+    }
   }
 
   // MARK: - Header
@@ -273,7 +309,7 @@ public struct MultiProviderMonitoringPanelView: View {
   private var header: some View {
     HStack(spacing: 12) {
       Text("Hub")
-        .font(.headline)
+        .font(.system(size: 13, weight: .bold, design: .monospaced))
 
       // Provider filter toggle (hidden in single mode)
       if layoutMode != .single {
@@ -356,6 +392,15 @@ public struct MultiProviderMonitoringPanelView: View {
   private var monitoredSessionsList: some View {
     if layoutMode == .single {
       singleModeContent
+        .background(
+          GeometryReader { geometry in
+            Color.clear
+              .onAppear { availableDetailWidth = geometry.size.width }
+              .onChange(of: geometry.size.width) { _, newWidth in
+                availableDetailWidth = newWidth
+              }
+          }
+        )
     } else {
       ScrollView {
         if layoutMode == .list {
@@ -413,54 +458,102 @@ public struct MultiProviderMonitoringPanelView: View {
         let planState = state.flatMap { PlanState.from(activities: $0.recentActivities) }
         let initialPrompt = viewModel.pendingPrompt(for: session.id)
 
-        MonitoringCardView(
-          session: session,
-          state: state,
-          planState: planState,
-          claudeClient: viewModel.claudeClient,
-          cliConfiguration: viewModel.cliConfiguration,
-          providerKind: item.providerKind,
-          showTerminal: viewModel.sessionsWithTerminalView.contains(session.id),
-          initialPrompt: initialPrompt,
-          terminalKey: session.id,
-          viewModel: viewModel,
-          onToggleTerminal: { show in
-            viewModel.setTerminalView(for: session.id, show: show)
-          },
-          onStopMonitoring: {
-            viewModel.stopMonitoring(session: session)
-          },
-          onConnect: {
-            _ = viewModel.connectToSession(session)
-          },
-          onCopySessionId: {
-            viewModel.copySessionId(session)
-          },
-          onOpenSessionFile: {
-            openSessionFile(for: session, viewModel: viewModel)
-          },
-          onRefreshTerminal: {
-            viewModel.refreshTerminal(
-              forKey: session.id,
-              sessionId: session.id,
-              projectPath: session.projectPath
-            )
-          },
-          onInlineRequestSubmit: { prompt, sess in
-            viewModel.showTerminalWithPrompt(for: sess, prompt: prompt)
-          },
-          onPromptConsumed: {
-            viewModel.clearPendingPrompt(for: session.id)
-          },
-          isMaximized: false,
-          onToggleMaximize: { },
-          isPrimarySession: true,
-          showPrimaryIndicator: false
-        )
-        .id(session.id)
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        HSplitView {
+          MonitoringCardView(
+            session: session,
+            state: state,
+            planState: planState,
+            claudeClient: viewModel.claudeClient,
+            cliConfiguration: viewModel.cliConfiguration,
+            providerKind: item.providerKind,
+            showTerminal: viewModel.sessionsWithTerminalView.contains(session.id),
+            initialPrompt: initialPrompt,
+            terminalKey: session.id,
+            viewModel: viewModel,
+            onToggleTerminal: { show in
+              viewModel.setTerminalView(for: session.id, show: show)
+            },
+            onStopMonitoring: {
+              viewModel.stopMonitoring(session: session)
+            },
+            onConnect: {
+              _ = viewModel.connectToSession(session)
+            },
+            onCopySessionId: {
+              viewModel.copySessionId(session)
+            },
+            onOpenSessionFile: {
+              openSessionFile(for: session, viewModel: viewModel)
+            },
+            onRefreshTerminal: {
+              viewModel.refreshTerminal(
+                forKey: session.id,
+                sessionId: session.id,
+                projectPath: session.projectPath
+              )
+            },
+            onInlineRequestSubmit: { prompt, sess in
+              viewModel.showTerminalWithPrompt(for: sess, prompt: prompt)
+            },
+            onShowDiff: canShowSidePanel ? { session, projectPath in
+              sidePanelContent = .diff(sessionId: session.id, session: session, projectPath: projectPath)
+            } : nil,
+            onShowPlan: canShowSidePanel ? { session, planState in
+              sidePanelContent = .plan(sessionId: session.id, session: session, planState: planState)
+            } : nil,
+            onShowWebPreview: canShowSidePanel ? { session, projectPath in
+              sidePanelContent = .webPreview(sessionId: session.id, session: session, projectPath: projectPath)
+            } : nil,
+            onPromptConsumed: {
+              viewModel.clearPendingPrompt(for: session.id)
+            },
+            isMaximized: false,
+            onToggleMaximize: { },
+            isPrimarySession: true,
+            showPrimaryIndicator: false,
+            isSidePanelOpen: sidePanelContent != nil
+          )
+          .id(session.id)
+          .frame(maxWidth: .infinity, maxHeight: .infinity)
+
+          if let panelContent = sidePanelContent {
+            sidePanelView(for: panelContent, viewModel: viewModel)
+              .frame(minWidth: 700)
+          }
+        }
         .padding(12)
       }
+    }
+  }
+
+  @ViewBuilder
+  private func sidePanelView(for content: SidePanelContent, viewModel: CLISessionsViewModel) -> some View {
+    switch content {
+    case .diff(_, let session, let projectPath):
+      GitDiffView(
+        session: session,
+        projectPath: projectPath,
+        onDismiss: { withAnimation(.easeInOut(duration: 0.25)) { sidePanelContent = nil } },
+        claudeClient: viewModel.claudeClient,
+        cliConfiguration: viewModel.cliConfiguration,
+        providerKind: visibleItems.first?.providerKind ?? .claude,
+        onInlineRequestSubmit: { prompt, sess in viewModel.showTerminalWithPrompt(for: sess, prompt: prompt) },
+        isEmbedded: true
+      )
+    case .plan(_, let session, let planState):
+      PlanView(
+        session: session,
+        planState: planState,
+        onDismiss: { withAnimation(.easeInOut(duration: 0.25)) { sidePanelContent = nil } },
+        isEmbedded: true
+      )
+    case .webPreview(_, let session, let projectPath):
+      WebPreviewView(
+        session: session,
+        projectPath: projectPath,
+        onDismiss: { withAnimation(.easeInOut(duration: 0.25)) { sidePanelContent = nil } },
+        isEmbedded: true
+      )
     }
   }
 
